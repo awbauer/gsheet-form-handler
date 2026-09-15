@@ -46,5 +46,5 @@
   }
 
   // Secrets (set with `npx wrangler secret put <NAME>`, never in this file):
-  //   GOOGLE_SERVICE_ACCOUNT_JSON - the full service-account key JSON
+  //   GOOGLE_SERVICE_ACCOUNT_KEY - the full service-account key JSON
 }

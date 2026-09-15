@@ -1,6 +1,6 @@
 // Google service-account auth + a thin Sheets API client.
 //
-// The Worker holds a service-account key (GOOGLE_SERVICE_ACCOUNT_JSON secret),
+// The Worker holds a service-account key (GOOGLE_SERVICE_ACCOUNT_KEY secret),
 // signs a short-lived assertion with it, and trades that for an OAuth access
 // token. There is no user consent flow and no Apps Script runtime in the way:
 // every spreadsheet the Worker writes must be shared with the service
@@ -21,20 +21,20 @@ const TOKEN_EXPIRY_SKEW_MS = 60_000;
 let cachedToken = null;
 
 export function loadServiceAccount(env) {
-  const raw = env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  const raw = env.GOOGLE_SERVICE_ACCOUNT_KEY;
   if (!raw) {
-    throw new HttpError(500, 'not_configured', 'the GOOGLE_SERVICE_ACCOUNT_JSON secret is not set');
+    throw new HttpError(500, 'not_configured', 'the GOOGLE_SERVICE_ACCOUNT_KEY secret is not set');
   }
 
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new HttpError(500, 'not_configured', 'GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON');
+    throw new HttpError(500, 'not_configured', 'GOOGLE_SERVICE_ACCOUNT_KEY is not valid JSON');
   }
 
   if (!parsed.client_email || !parsed.private_key) {
-    throw new HttpError(500, 'not_configured', 'GOOGLE_SERVICE_ACCOUNT_JSON needs client_email and private_key');
+    throw new HttpError(500, 'not_configured', 'GOOGLE_SERVICE_ACCOUNT_KEY needs client_email and private_key');
   }
 
   return {

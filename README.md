@@ -135,7 +135,7 @@ the address to share with. `GET /whoami` also reports it, so you can copy it out
 before the first submission.
 
 ```sh
-npx wrangler secret put GOOGLE_SERVICE_ACCOUNT_JSON   # paste the whole key JSON
+npx wrangler secret put GOOGLE_SERVICE_ACCOUNT_KEY   # paste the whole key JSON
 ```
 
 ### 2. Cloudflare Access application
@@ -261,7 +261,7 @@ code is stable; the detail is advisory text for whoever is wiring the form up.
 | `STAMP_IDENTITY` | `true` | Add `_received_at` / `_identity`; a sheet's `stamp` wins. |
 | `CORS_ORIGINS` | *(empty)* | Comma-separated origins, or `*`. Empty means no CORS headers. |
 | `MAX_BODY_BYTES` | `131072` | Request body ceiling. |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | — | **Secret.** The service-account key JSON. |
+| `GOOGLE_SERVICE_ACCOUNT_KEY` | — | **Secret.** The service-account key JSON. |
 
 Per-sheet keys: `auds` (required; `[]` allows any authenticated caller),
 `label`, `tab`, `stamp`, `allowMissingFields`, `requireEmails`,
