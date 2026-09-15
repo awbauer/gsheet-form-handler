@@ -1,0 +1,50 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gsheet-form-handler",
+  "main": "src/index.js",
+  "compatibility_date": "2025-09-01",
+  "observability": { "enabled": true },
+
+  "vars": {
+    // Your Zero Trust team domain: "acme" or "acme.cloudflareaccess.com".
+    "ACCESS_TEAM_DOMAIN": "",
+
+    // Keyed by Google spreadsheet id; the value lists the Access application
+    // AUD tags allowed to write that sheet (Zero Trust > Access >
+    // Applications > (app) > Overview). The array form below is shorthand for
+    // { "auds": [...] }.
+    //
+    // AN EMPTY ARRAY ALLOWS ANY AUTHENTICATED CALLER -- that means any valid
+    // Access token from your team, including one issued for an unrelated
+    // application, so keep this Worker off a route reachable without Access.
+    // To mean "everyone in this application", list its AUD instead.
+    //
+    // Optional per sheet: "label", "tab", "stamp", "allowMissingFields", and
+    // the requireEmails / requireEmailDomains / requireServiceTokens /
+    // requireIdpGroups / requireAccessGroups narrowing constraints.
+    // See src/sheet-access.js.
+    "SHEET_ACCESS": {
+      "REPLACE_WITH_GOOGLE_SPREADSHEET_ID": {
+        "auds": ["REPLACE_WITH_ACCESS_APPLICATION_AUD"],
+        "label": "example form"
+      }
+    },
+
+    // Sheet used when a request names none. Leave empty to require an explicit
+    // ?SHEET_ID= or /submit/<id> on every submission.
+    "DEFAULT_SHEET_ID": "",
+
+    // Tab rows are appended to, unless a sheet overrides it.
+    "RESPONSES_TAB": "Responses",
+    // Prepend _received_at / _identity columns to every row.
+    "STAMP_IDENTITY": "true",
+    // Comma-separated browser origins allowed to POST cross-origin, or "*".
+    // Empty disables CORS entirely (same-origin posts only).
+    "CORS_ORIGINS": "",
+    // Reject bodies larger than this many bytes.
+    "MAX_BODY_BYTES": "131072"
+  }
+
+  // Secrets (set with `npx wrangler secret put <NAME>`, never in this file):
+  //   GOOGLE_SERVICE_ACCOUNT_KEY - the full service-account key JSON
+}
