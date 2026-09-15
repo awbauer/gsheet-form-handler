@@ -1,0 +1,43 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gsheet-form-handler",
+  "main": "src/index.js",
+  "compatibility_date": "2025-09-01",
+  "observability": { "enabled": true },
+
+  "vars": {
+    // Your Zero Trust team domain: "acme" or "acme.cloudflareaccess.com".
+    "ACCESS_TEAM_DOMAIN": "",
+
+    // One entry per Access application in front of this Worker. "aud" is the
+    // application's Application Audience tag (Zero Trust > Access >
+    // Applications > (app) > Overview); "sheetId" is the Google spreadsheet it
+    // writes to. WHO may write that sheet is the Access policy on that
+    // application, not anything in this file.
+    //
+    // Optional per binding: "tab", "label", "path", "stamp",
+    // "allowMissingFields", and the requireEmails / requireEmailDomains /
+    // requireServiceTokens / requireIdpGroups / requireAccessGroups
+    // narrowing constraints. See src/bindings.js.
+    "SHEET_BINDINGS": [
+      {
+        "aud": "REPLACE_WITH_ACCESS_APPLICATION_AUD",
+        "sheetId": "REPLACE_WITH_GOOGLE_SPREADSHEET_ID",
+        "label": "example form"
+      }
+    ],
+
+    // Tab rows are appended to, unless a binding overrides it.
+    "RESPONSES_TAB": "Responses",
+    // Prepend _received_at / _identity columns to every row.
+    "STAMP_IDENTITY": "true",
+    // Comma-separated browser origins allowed to POST cross-origin, or "*".
+    // Empty disables CORS entirely (same-origin posts only).
+    "CORS_ORIGINS": "",
+    // Reject bodies larger than this many bytes.
+    "MAX_BODY_BYTES": "131072"
+  }
+
+  // Secrets (set with `npx wrangler secret put <NAME>`, never in this file):
+  //   GOOGLE_SERVICE_ACCOUNT_JSON - the full service-account key JSON
+}
