@@ -35,9 +35,24 @@ test('team domain accepts a bare team name or a full hostname', () => {
   assert.equal(issuerFor('acme'), ISSUER);
 });
 
-test('a well-formed token returns the audience that matched', () => {
+test('a well-formed token returns every audience it carries', () => {
   const result = validateClaims(claims(), { issuer: ISSUER, audiences: new Set([AUD]), now: NOW });
-  assert.equal(result.aud, AUD);
+  assert.deepEqual(result.auds, [AUD]);
+});
+
+test('a null audience set accepts any application, as an open sheet requires', () => {
+  const result = validateClaims(claims({ aud: ['some-other-app'] }), { issuer: ISSUER, audiences: null, now: NOW });
+  assert.deepEqual(result.auds, ['some-other-app']);
+  // The issuer is still pinned, so this is "any app in your team", not "any token".
+  assert.equal(
+    codeOf(() => validateClaims(claims({ iss: 'https://evil.cloudflareaccess.com' }), { issuer: ISSUER, audiences: null, now: NOW })),
+    'access_jwt_wrong_issuer',
+  );
+  // A token naming no application at all is still refused.
+  assert.equal(
+    codeOf(() => validateClaims(claims({ aud: [] }), { issuer: ISSUER, audiences: null, now: NOW })),
+    'access_jwt_wrong_audience',
+  );
 });
 
 test('claims are rejected for issuer, audience, expiry and future validity', () => {
@@ -60,14 +75,12 @@ test('claims are rejected for issuer, audience, expiry and future validity', () 
   );
 });
 
-test('a token valid for two configured applications is refused rather than guessed', () => {
+test('a token carrying several audiences keeps all of them', () => {
+  // No longer ambiguous: the request names the sheet, and the sheet's own list
+  // decides which of these audiences may write it.
   const other = 'other-aud';
-  assert.equal(
-    codeOf(() =>
-      validateClaims(claims({ aud: [AUD, other] }), { issuer: ISSUER, audiences: new Set([AUD, other]), now: NOW }),
-    ),
-    'access_jwt_ambiguous_audience',
-  );
+  const result = validateClaims(claims({ aud: [AUD, other] }), { issuer: ISSUER, audiences: new Set([AUD]), now: NOW });
+  assert.deepEqual(result.auds, [AUD, other]);
 });
 
 test('a small clock skew either way is tolerated', () => {
@@ -77,18 +90,18 @@ test('a small clock skew either way is tolerated', () => {
 });
 
 test('a user identity comes from the email claim, lower-cased', () => {
-  const identity = identityFromClaims(claims({ email: 'Ada@Example.com' }), AUD);
+  const identity = identityFromClaims(claims({ email: 'Ada@Example.com' }), [AUD]);
   assert.equal(identity.type, 'user');
   assert.equal(identity.email, 'ada@example.com');
   assert.equal(identity.label, 'ada@example.com');
-  assert.equal(identity.aud, AUD);
+  assert.deepEqual(identity.auds, [AUD]);
 });
 
 test('a service token identity comes from common_name, as Access sends it', () => {
   // Shape taken from the Cloudflare docs: no email, empty sub.
   const identity = identityFromClaims(
     { iss: ISSUER, aud: [AUD], exp: NOW + 600, common_name: 'e367826f93b8d71185e03fe518aff3b4.access', sub: '' },
-    AUD,
+    [AUD],
   );
   assert.equal(identity.type, 'service_token');
   assert.equal(identity.email, null);
@@ -97,7 +110,7 @@ test('a service token identity comes from common_name, as Access sends it', () =
 
 test('a token with no principal at all is refused', () => {
   assert.equal(
-    codeOf(() => identityFromClaims({ iss: ISSUER, aud: [AUD], exp: NOW + 600 }, AUD)),
+    codeOf(() => identityFromClaims({ iss: ISSUER, aud: [AUD], exp: NOW + 600 }, [AUD])),
     'access_identity_unknown',
   );
 });

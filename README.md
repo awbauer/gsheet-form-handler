@@ -9,7 +9,7 @@ with a Google service account, so it can live on your own hostname and serve
 several spreadsheets from one deployment.
 
 ```
-POST https://forms.example.com/submit
+POST https://forms.example.com/submit/1AbC...
 Content-Type: application/json
 
 { "name": "Ada", "email": "ada@example.com", "message": "hello" }
@@ -22,40 +22,69 @@ Content-Type: application/json
 
 ## How access control works
 
-**There is no user database in this Worker.** The group of people who may write
-a given spreadsheet is a Cloudflare Access policy, and nothing else.
+**There is no user database in this Worker.** Who may write a given spreadsheet
+is decided by Cloudflare Access policy, and `SHEET_ACCESS` says which Access
+applications count for which sheet.
 
-The link between the two is the Access **AUD tag**. You put one Access
-application in front of each sheet's endpoint; Access authenticates the caller,
-applies your policy, and signs a JWT whose `aud` claim names the application it
-let them through for. The Worker verifies that JWT and looks `aud` up in
-`SHEET_BINDINGS` to find the spreadsheet id:
+The link between the two is the Access **AUD tag**. You put an Access
+application in front of the endpoint; Access authenticates the caller, applies
+your policy, and signs a JWT whose `aud` claim names the application it let them
+through for. `SHEET_ACCESS` is keyed by spreadsheet id and lists the audiences
+allowed to write it:
 
+```jsonc
+"SHEET_ACCESS": {
+  // written by two applications: the finance form and an admin console
+  "1AbC...": ["32eafc76...", "9b41de02..."],
+
+  // written by anyone holding a valid Access token from your team
+  "1XyZ...": []
+}
 ```
-Access application "Finance intake"  ──aud──▶  sheetId 1AbC...
-  policy: Access Group "Finance" + service token "forms-ci"
 
-Access application "HR intake"       ──aud──▶  sheetId 1XyZ...
-  policy: emails ending in @example.com, requires WARP
-```
+A request names the sheet it is writing — `?SHEET_ID=`, `/submit/<id>`, or
+`DEFAULT_SHEET_ID` — and the Worker checks the caller's audience against that
+sheet's list. Naming the sheet is not the same as being trusted with it: an id
+that is not in the map and an id the caller may not write are refused
+identically, so the parameter cannot be used to discover which sheets exist.
 
 The consequences are worth being explicit about:
 
-- **Membership lives in Zero Trust**, where it is already audited, already
-  syncs from your IdP, and already supports Access Groups, SCIM, device
-  posture, country and mTLS rules. The Worker does not re-implement any of it
-  and cannot drift out of sync with it.
-- **The caller never names a spreadsheet.** The Apps Script took `?SHEET_ID=`
-  from the URL; here the sheet is derived from a claim the caller cannot forge,
-  so there is no id to tamper with and no sheet enumeration to defend against.
+- **Membership lives in Zero Trust**, where it is already audited, already syncs
+  from your IdP, and already supports Access Groups, SCIM, device posture,
+  country and mTLS rules. The Worker does not re-implement any of it and cannot
+  drift out of sync with it.
+- **Several applications can share a sheet, and one application can write
+  several sheets.** Both are just list membership.
 - **Unauthorized requests never reach the Worker at all** — Access rejects them
   at the edge — and if one somehow does, it fails JWT verification here.
+
+### What an empty array actually means
+
+`[]` means **any caller holding a valid Access token issued by your team** — not
+"anyone in the application in front of this Worker". Cloudflare signs one token
+per application, all from the same team issuer, so a user authorized only for
+some unrelated application in your Zero Trust org also satisfies an empty list.
+Two things follow:
+
+- **Keep this Worker off a route that is reachable without Access** — turn off
+  its `workers.dev` subdomain. With an empty list, that route is the only thing
+  between a stray team token and your sheet.
+- **To mean "everyone in *this* application", list that application's AUD**
+  rather than leaving the array empty. To open a sheet broadly but not that
+  broadly, leave the array empty and add `requireEmailDomains` or
+  `requireIdpGroups`, which still apply.
+
+One more consequence: if any sheet is open, the Worker cannot pin the JWT
+audience check to a known set, because any team-issued token has to get past it
+to reach the per-sheet check. The issuer is still pinned, and a token naming no
+application at all is still refused.
 
 ### Which Access attributes are usable, and which are not
 
 | Attribute | Where it comes from | Use it for |
 | --- | --- | --- |
-| `aud` | Always in the app token | **Selecting the sheet.** Never trimmed, never absent. |
+| `aud` | Always in the app token | **Authorizing the sheet.** Never trimmed, never absent. |
 | `email` | App token, human logins | Identifying the submitter; stamped into `_identity`. |
 | `common_name` | App token, service tokens | Identifying a machine client (`sub` is empty and there is no email). |
 | `custom.groups` | App token, **only if** you configure `groups` as a custom SAML attribute / OIDC claim | A hint, not a gate — see below. |
@@ -72,10 +101,10 @@ Cloudflare's own documentation is blunt about the group claim:
 
 So a Worker that gated on `custom.groups` would deny exactly the users in the
 most groups, intermittently, and look like a flaky bug. That is why groups are
-not the primary mechanism here. If you want group-based routing anyway, a
-binding can declare `requireIdpGroups` (reads the claim) or
-`requireAccessGroups` (calls `get-identity`, authoritative) — but prefer
-expressing it as an Access policy and letting `aud` carry the answer.
+not the primary mechanism here. If you want group-based narrowing anyway, a
+sheet can declare `requireIdpGroups` (reads the claim) or `requireAccessGroups`
+(calls `get-identity`, authoritative) — but prefer expressing it as an Access
+policy and letting `aud` carry the answer.
 
 ### What this Worker does *not* trust
 
@@ -127,11 +156,12 @@ In `wrangler.jsonc`:
 ```jsonc
 "vars": {
   "ACCESS_TEAM_DOMAIN": "acme",
-  "SHEET_BINDINGS": [
-    { "aud": "32eafc76...", "sheetId": "1AbC...", "label": "finance intake" },
-    { "aud": "9b41de02...", "sheetId": "1XyZ...", "label": "hr intake",
-      "tab": "Submissions", "allowMissingFields": true }
-  ]
+  "SHEET_ACCESS": {
+    "1AbC...": ["32eafc76..."],
+    "1XyZ...": { "auds": ["9b41de02...", "32eafc76..."], "label": "hr intake",
+                 "tab": "Submissions", "allowMissingFields": true }
+  },
+  "DEFAULT_SHEET_ID": ""
 }
 ```
 
@@ -142,8 +172,8 @@ Access application and the Worker sit on the same path.
 
 | Method | Path | Behaviour |
 | --- | --- | --- |
-| `POST` | any path with a binding | Append a row. |
-| `GET` | `/whoami` | What Access said about you, which sheet you are bound to, and the service-account address to share with. |
+| `POST` | `/submit/<sheet id>`, or any path with `?SHEET_ID=` | Append a row. |
+| `GET` | `/whoami` | What Access said about you, which sheets you may write, and the service-account address to share with. |
 | `GET` | `/health` | Liveness and "the configuration parses". Unauthenticated, reveals nothing. |
 
 `POST` accepts `application/json`, `application/x-www-form-urlencoded` and
@@ -175,7 +205,7 @@ is rejected with `409 header_mismatch`** and nothing is written:
 
 ```json
 { "ok": false, "error": "header_mismatch",
-  "detail": "the submission does not match the header row of \"Responses\" (fields not in the sheet: emailAddress; columns the submission did not include: email). Add the columns to the sheet, correct the form, or set \"allowMissingFields\" on the binding." }
+  "detail": "the submission does not match the header row of \"Responses\" (fields not in the sheet: emailAddress; columns the submission did not include: email). Add the columns to the sheet, correct the form, or set \"allowMissingFields\" on the sheet." }
 ```
 
 The Apps Script appended a new column the first time it saw an unfamiliar key.
@@ -187,13 +217,13 @@ the problem in front of whoever changed the form, while it is still cheap to
 fix, and keeps the column set something a human decided on.
 
 To change a form's shape, edit the header row in the sheet and deploy the client
-change. To widen it in one step, rename the tab (or set `"tab"` on the binding)
+change. To widen it in one step, rename the tab (or set `"tab"` on the sheet)
 so the next submission starts a fresh sheet.
 
 Key **order** is not checked — JSON object order carries no meaning — only the
 set of names.
 
-`"allowMissingFields": true` on a binding relaxes one half of this: a submission
+`"allowMissingFields": true` on a sheet relaxes one half of this: a submission
 may omit columns (they are written blank), but an unknown field is still an
 error. Plain HTML forms generally need it, because an unchecked checkbox posts
 nothing at all.
@@ -209,13 +239,13 @@ code is stable; the detail is advisory text for whoever is wiring the form up.
 | `access_jwt_bad_signature`, `access_jwt_unknown_key`, `access_jwt_malformed` | 401 | Token did not verify. |
 | `access_jwt_expired` | 401 | Sign in again. |
 | `access_jwt_wrong_issuer`, `access_jwt_wrong_audience` | 403 | Token is from another team or another application. |
-| `no_sheet_for_application` | 403 | Valid token, but no binding for that `aud` and path. |
-| `not_authorized` | 403 | Passed Access, failed a binding's extra constraints. |
+| `sheet_not_specified` | 400 | The request named no sheet and `DEFAULT_SHEET_ID` is unset. |
+| `not_authorized` | 403 | The sheet is not configured, or this caller's application is not on its list. |
 | `invalid_json`, `invalid_payload`, `invalid_field_name` | 400 | Unusable body. |
 | `header_mismatch` | 409 | The form's shape and the sheet's header row disagree. |
 | `payload_too_large`, `field_too_large` | 413 | Over `MAX_BODY_BYTES` or a 50k-character cell. |
 | `too_many_columns` | 422 | A first submission defining more than 512 columns. |
-| `not_configured` | 500 | Missing team domain, bindings, or service-account secret. |
+| `not_configured` | 500 | Missing team domain, sheet map, or service-account secret. |
 | `sheet_not_shared` | 502 | Share the spreadsheet with the service account. |
 | `sheet_not_found` | 502 | Google has no spreadsheet with that id. |
 | `sheets_api_unavailable` | 503 | Google rate-limited us or is down; retry. |
@@ -225,16 +255,18 @@ code is stable; the detail is advisory text for whoever is wiring the form up.
 | Var | Default | Purpose |
 | --- | --- | --- |
 | `ACCESS_TEAM_DOMAIN` | — | `acme` or `acme.cloudflareaccess.com`. |
-| `SHEET_BINDINGS` | — | Array of `aud` → `sheetId` bindings; see `src/bindings.js`. |
-| `RESPONSES_TAB` | `Responses` | Default tab; a binding's `tab` wins. |
-| `STAMP_IDENTITY` | `true` | Add `_received_at` / `_identity`; a binding's `stamp` wins. |
+| `SHEET_ACCESS` | — | Spreadsheet id → allowed Access AUDs; see `src/sheet-access.js`. |
+| `DEFAULT_SHEET_ID` | *(empty)* | Sheet used when a request names none. |
+| `RESPONSES_TAB` | `Responses` | Default tab; a sheet's `tab` wins. |
+| `STAMP_IDENTITY` | `true` | Add `_received_at` / `_identity`; a sheet's `stamp` wins. |
 | `CORS_ORIGINS` | *(empty)* | Comma-separated origins, or `*`. Empty means no CORS headers. |
 | `MAX_BODY_BYTES` | `131072` | Request body ceiling. |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | — | **Secret.** The service-account key JSON. |
 
-Per-binding keys: `aud`, `sheetId`, `label`, `tab`, `path`, `stamp`,
-`allowMissingFields`, `requireEmails`, `requireEmailDomains`,
-`requireServiceTokens`, `requireIdpGroups`, `requireAccessGroups`.
+Per-sheet keys: `auds` (required; `[]` allows any authenticated caller),
+`label`, `tab`, `stamp`, `allowMissingFields`, `requireEmails`,
+`requireEmailDomains`, `requireServiceTokens`, `requireIdpGroups`,
+`requireAccessGroups`. An array in place of the object is shorthand for `auds`.
 
 ## Known limits
 
@@ -244,6 +276,8 @@ Per-binding keys: `aud`, `sheetId`, `label`, `tab`, `path`, `stamp`,
   race left is two submissions to a brand-new empty tab, where both may try to
   write the header row. Send the first submission yourself, or pre-create the
   header row, if that matters.
+- **An empty `auds` array is wider than it looks** — see above. It is the one
+  setting here that can be wrong in a way Access will not catch for you.
 - **`requireAccessGroups` does not work for service tokens.** A service token
   has no IdP identity to fetch, so `get-identity` has nothing to return. Use
   `requireServiceTokens`, or put the token in the Access policy.
@@ -263,7 +297,7 @@ npx wrangler dev
 npx wrangler tail   # unexpected errors are logged here, not returned to callers
 ```
 
-`npm test` covers claim validation, binding selection, header-drift detection,
+`npm test` covers claim validation, sheet authorization, header-drift detection,
 value handling and payload sanitising — the parts where a mistake is a security
 or data-integrity problem. The Sheets and Access HTTP calls are thin wrappers
 over `fetch` and are exercised against the real services with `wrangler dev`.

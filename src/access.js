@@ -14,8 +14,9 @@
 //   * a service token (the usual choice for a server-side form backend),
 //     identified by `common_name`, with an empty `sub` and no email.
 //
-// The `aud` claim is the load-bearing one: it names the Access application the
-// caller was authorized for, and src/bindings.js turns that into a spreadsheet.
+// The `aud` claim names the Access application the caller was authorized for.
+// src/sheet-access.js checks it against the list of applications allowed to
+// write the sheet the request named.
 
 import { HttpError } from './http.js';
 
@@ -101,22 +102,25 @@ async function fetchSigningKeys(issuer) {
   return keys;
 }
 
-// Everything about a token that does not need the network. Returns the single
-// audience that matched, which is what selects the spreadsheet downstream.
-// Exported for tests.
+// Everything about a token that does not need the network. Returns every
+// audience the token carries; which of them may write a given sheet is decided
+// per sheet in src/sheet-access.js. Exported for tests.
+//
+// `audiences` is the union of every audience named in the configuration, used
+// to reject a token from an unrelated Access application early. It is null
+// when some sheet accepts any authenticated user, since there is then no set to
+// pin against — the per-sheet check is the gate in that case.
 export function validateClaims(claims, { issuer, audiences, now = Math.floor(Date.now() / 1000) }) {
   if (claims.iss !== issuer) {
     throw new HttpError(403, 'access_jwt_wrong_issuer', `token was issued by ${claims.iss || 'nobody'}, expected ${issuer}`);
   }
 
   const claimed = Array.isArray(claims.aud) ? claims.aud : claims.aud ? [claims.aud] : [];
-  const matched = claimed.filter((aud) => audiences.has(aud));
-  if (matched.length === 0) {
-    throw new HttpError(403, 'access_jwt_wrong_audience', 'token was issued for an Access application this Worker has no binding for');
+  if (claimed.length === 0) {
+    throw new HttpError(403, 'access_jwt_wrong_audience', 'token names no Access application');
   }
-  if (matched.length > 1) {
-    // Which sheet to write would be a coin flip; refuse rather than guess.
-    throw new HttpError(403, 'access_jwt_ambiguous_audience', `token matches ${matched.length} configured applications`);
+  if (audiences && !claimed.some((aud) => audiences.has(aud))) {
+    throw new HttpError(403, 'access_jwt_wrong_audience', 'token was issued for an Access application this Worker does not know about');
   }
 
   if (typeof claims.exp !== 'number' || claims.exp + CLOCK_SKEW_SECONDS < now) {
@@ -128,7 +132,7 @@ export function validateClaims(claims, { issuer, audiences, now = Math.floor(Dat
     throw new HttpError(401, 'access_jwt_not_yet_valid', 'token is not valid yet');
   }
 
-  return { claims, aud: matched[0] };
+  return { claims, auds: claimed };
 }
 
 // IdP groups reach the token only when `groups` is configured as a custom SAML
@@ -145,7 +149,7 @@ export function collectIdpGroups(claims) {
   return [...found];
 }
 
-export function identityFromClaims(claims, aud) {
+export function identityFromClaims(claims, auds) {
   const email = typeof claims.email === 'string' && claims.email.trim() ? claims.email.trim().toLowerCase() : null;
   const commonName = typeof claims.common_name === 'string' && claims.common_name.trim() ? claims.common_name.trim() : null;
   const type = email ? 'user' : commonName ? 'service_token' : 'unknown';
@@ -156,7 +160,7 @@ export function identityFromClaims(claims, aud) {
 
   return {
     type,
-    aud,
+    auds,
     email,
     commonName,
     idpGroups: collectIdpGroups(claims),
@@ -251,6 +255,6 @@ export async function authenticate(request, env, audiences) {
     throw new HttpError(401, 'access_jwt_bad_signature', 'token signature did not verify');
   }
 
-  const { claims, aud } = validateClaims(decodeJsonSegment(parts[1], 'payload'), { issuer, audiences });
-  return identityFromClaims(claims, aud);
+  const { claims, auds } = validateClaims(decodeJsonSegment(parts[1], 'payload'), { issuer, audiences });
+  return identityFromClaims(claims, auds);
 }
