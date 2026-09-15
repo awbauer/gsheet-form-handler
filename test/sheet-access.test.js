@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 
 import {
   parseSheetAccess,
-  configuredAudiences,
   audienceAllowed,
   principalAllowed,
   groupsAllowed,
@@ -26,20 +25,17 @@ function user(overrides = {}) {
     type: 'user',
     auds: [FINANCE_AUD],
     email: 'ada@example.com',
-    commonName: null,
-    idpGroups: [],
+    groups: [],
     label: 'ada@example.com',
     ...overrides,
   };
 }
 
-const noGroups = async () => {
-  throw new Error('get-identity should not have been called');
-};
-
-async function codeOf(promise) {
+// These throw synchronously, so the call is wrapped rather than passed as a
+// ready-made promise.
+async function codeOf(fn) {
   try {
-    await promise;
+    await fn();
   } catch (err) {
     return err.code;
   }
@@ -66,7 +62,7 @@ test('sheets parse from a JSON string as well as an object', () => {
 });
 
 test('misconfiguration is reported rather than defaulted away', async () => {
-  const fails = (value) => codeOf(Promise.resolve().then(() => parseSheetAccess(env(value))));
+  const fails = (value) => codeOf(() => parseSheetAccess(env(value)));
   assert.equal(await fails('not json'), 'not_configured');
   assert.equal(await fails({}), 'not_configured');
   assert.equal(await fails([['sheet-1', []]]), 'not_configured');
@@ -89,43 +85,31 @@ test('a listed sheet admits only the applications it names', () => {
   assert.equal(audienceAllowed(listed, user({ auds: [OTHER_AUD, ADMIN_AUD] })), true);
 });
 
-test('several applications can share one sheet, and one application several sheets', async () => {
+test('several applications can share one sheet, and one application several sheets', () => {
   const config = env({ 'sheet-1': [FINANCE_AUD, ADMIN_AUD], 'sheet-2': [ADMIN_AUD] });
-  const admin = user({ auds: [ADMIN_AUD] });
   assert.deepEqual(
-    (await writableSheets(config, admin, noGroups)).map((entry) => entry.sheetId),
+    writableSheets(config, user({ auds: [ADMIN_AUD] })).map((entry) => entry.sheetId),
     ['sheet-1', 'sheet-2'],
   );
   assert.deepEqual(
-    (await writableSheets(config, user({ auds: [FINANCE_AUD] }), noGroups)).map((entry) => entry.sheetId),
+    writableSheets(config, user({ auds: [FINANCE_AUD] })).map((entry) => entry.sheetId),
     ['sheet-1'],
   );
 });
 
-test('the audience union pins the JWT check, unless some sheet is open', () => {
-  assert.deepEqual(
-    [...configuredAudiences(parseSheetAccess(env({ 'sheet-1': [FINANCE_AUD], 'sheet-2': [ADMIN_AUD] })))].sort(),
-    [ADMIN_AUD, FINANCE_AUD],
-  );
-  // One open sheet means any team-issued token has to get past step one, so
-  // there is nothing left to pin against.
-  assert.equal(configuredAudiences(parseSheetAccess(env({ 'sheet-1': [FINANCE_AUD], 'sheet-2': [] }))), null);
-});
-
-test('narrowing constraints still apply to an open sheet', async () => {
+test('narrowing constraints still apply to an open sheet', () => {
   const narrowed = sheet({ 'sheet-1': { auds: [], requireEmailDomains: ['example.com'] } }, 'sheet-1');
-  assert.equal(await callerMayWrite(narrowed, user({ email: 'ada@example.com' }), noGroups), true);
-  assert.equal(await callerMayWrite(narrowed, user({ email: 'bob@elsewhere.test' }), noGroups), false);
+  assert.equal(callerMayWrite(narrowed, user({ email: 'ada@example.com' })), true);
+  assert.equal(callerMayWrite(narrowed, user({ email: 'bob@elsewhere.test' })), false);
 });
 
-test('principal constraints match emails, domains and service tokens', () => {
+test('principal constraints match emails and domains', () => {
   const narrowed = sheet(
     {
       'sheet-1': {
         auds: [FINANCE_AUD],
         requireEmails: ['Ada@Example.com'],
         requireEmailDomains: ['@partner.test'],
-        requireServiceTokens: ['ci.access'],
       },
     },
     'sheet-1',
@@ -133,27 +117,33 @@ test('principal constraints match emails, domains and service tokens', () => {
   assert.equal(principalAllowed(narrowed, user({ email: 'ada@example.com' })), true);
   assert.equal(principalAllowed(narrowed, user({ email: 'bob@partner.test' })), true);
   assert.equal(principalAllowed(narrowed, user({ email: 'bob@elsewhere.test' })), false);
-  assert.equal(
-    principalAllowed(narrowed, user({ type: 'service_token', email: null, commonName: 'ci.access' })),
-    true,
-  );
 });
 
-test('access group constraints fall through to get-identity only when needed', async () => {
+test('a sheet that only names service tokens denies rather than opens', () => {
+  // Nothing can satisfy requireServiceTokens now that a service token is
+  // refused for having no identity, but declaring one must still keep the
+  // sheet closed instead of leaving it unconstrained.
+  const tokensOnly = sheet(
+    { 'sheet-1': { auds: [FINANCE_AUD], requireServiceTokens: ['ci.access'] } },
+    'sheet-1',
+  );
+  assert.equal(principalAllowed(tokensOnly, user()), false);
+  assert.equal(callerMayWrite(tokensOnly, user()), false);
+});
+
+test('either group key matches against the identity Access returned', () => {
   const narrowed = sheet(
     { 'sheet-1': { auds: [FINANCE_AUD], requireIdpGroups: ['Finance-Team'], requireAccessGroups: ['Finance'] } },
     'sheet-1',
   );
-  let calls = 0;
-  const load = async () => {
-    calls += 1;
-    return ['Finance'];
-  };
-
-  assert.equal(await groupsAllowed(narrowed, user({ idpGroups: ['Finance-Team'] }), noGroups), true);
-  // The claim can be trimmed away by Access, so the endpoint is authoritative.
-  assert.equal(await groupsAllowed(narrowed, user({ idpGroups: [] }), load), true);
-  assert.equal(calls, 1);
+  // Both keys read one authoritative list, so a sheet naming groups under
+  // either of them is matched against the union.
+  assert.equal(groupsAllowed(narrowed, user({ groups: ['Finance-Team'] })), true);
+  assert.equal(groupsAllowed(narrowed, user({ groups: ['Finance'] })), true);
+  assert.equal(groupsAllowed(narrowed, user({ groups: ['Marketing'] })), false);
+  assert.equal(groupsAllowed(narrowed, user({ groups: [] })), false);
+  // A sheet naming no groups is not gated on them.
+  assert.equal(groupsAllowed(sheet({ 'sheet-1': [FINANCE_AUD] }, 'sheet-1'), user({ groups: [] })), true);
 });
 
 test('the sheet is named by query parameter, path, or the configured default', () => {
@@ -170,29 +160,28 @@ test('the sheet is named by query parameter, path, or the configured default', (
 
 test('a request that names no sheet is a client error, not a denial', async () => {
   assert.equal(
-    await codeOf(resolveSheet(env({ 'sheet-1': [FINANCE_AUD] }), user(), new URL('https://forms.test/'), noGroups)),
+    await codeOf(() => resolveSheet(env({ 'sheet-1': [FINANCE_AUD] }), user(), new URL('https://forms.test/'))),
     'sheet_not_specified',
   );
 });
 
 test('an unconfigured sheet and a forbidden sheet are indistinguishable', async () => {
   const config = env({ 'sheet-1': [FINANCE_AUD] });
-  const unknown = await codeOf(
-    resolveSheet(config, user(), new URL('https://forms.test/submit/does-not-exist'), noGroups),
+  const unknown = await codeOf(() =>
+    resolveSheet(config, user(), new URL('https://forms.test/submit/does-not-exist')),
   );
-  const forbidden = await codeOf(
-    resolveSheet(config, user({ auds: [OTHER_AUD] }), new URL('https://forms.test/submit/sheet-1'), noGroups),
+  const forbidden = await codeOf(() =>
+    resolveSheet(config, user({ auds: [OTHER_AUD] }), new URL('https://forms.test/submit/sheet-1')),
   );
   assert.equal(unknown, 'not_authorized');
   assert.equal(forbidden, 'not_authorized');
 });
 
-test('an allowed caller resolves to the sheet they named', async () => {
-  const resolved = await resolveSheet(
+test('an allowed caller resolves to the sheet they named', () => {
+  const resolved = resolveSheet(
     env({ 'sheet-1': { auds: [FINANCE_AUD], label: 'finance intake', tab: 'Q3' } }),
     user(),
     new URL('https://forms.test/submit/sheet-1'),
-    noGroups,
   );
   assert.equal(resolved.sheetId, 'sheet-1');
   assert.equal(resolved.label, 'finance intake');
