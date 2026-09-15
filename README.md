@@ -28,9 +28,10 @@ applications count for which sheet.
 
 The link between the two is the Access **AUD tag**. You put an Access
 application in front of the endpoint; Access authenticates the caller, applies
-your policy, and signs a JWT whose `aud` claim names the application it let them
-through for. `SHEET_ACCESS` is keyed by spreadsheet id and lists the audiences
-allowed to write it:
+your policy, and hands the Worker the result as `ctx.access` — including
+`ctx.access.aud`, the tag of the application it let them through for.
+`SHEET_ACCESS` is keyed by spreadsheet id and lists the audiences allowed to
+write it:
 
 ```jsonc
 "SHEET_ACCESS": {
@@ -57,63 +58,57 @@ The consequences are worth being explicit about:
 - **Several applications can share a sheet, and one application can write
   several sheets.** Both are just list membership.
 - **Unauthorized requests never reach the Worker at all** — Access rejects them
-  at the edge — and if one somehow does, it fails JWT verification here.
+  at the edge — and a request that arrives without having been authenticated by
+  Access has no `ctx.access` and is refused here.
 
 ### What an empty array actually means
 
-`[]` means **any caller holding a valid Access token issued by your team** — not
-"anyone in the application in front of this Worker". Cloudflare signs one token
-per application, all from the same team issuer, so a user authorized only for
-some unrelated application in your Zero Trust org also satisfies an empty list.
-Two things follow:
+`[]` means **any caller Access admitted to this route**. The runtime populates
+`ctx.access` only when Access authenticated the request against an application
+covering the route being called, so a token minted for some unrelated
+application elsewhere in your Zero Trust org does not satisfy an empty list, and
+a route Access is not in front of produces no identity at all rather than a
+usable one.
 
-- **Keep this Worker off a route that is reachable without Access** — turn off
-  its `workers.dev` subdomain. With an empty list, that route is the only thing
-  between a stray team token and your sheet.
-- **To mean "everyone in *this* application", list that application's AUD**
-  rather than leaving the array empty. To open a sheet broadly but not that
-  broadly, leave the array empty and add `requireEmailDomains` or
-  `requireIdpGroups`, which still apply.
-
-One more consequence: if any sheet is open, the Worker cannot pin the JWT
-audience check to a known set, because any team-issued token has to get past it
-to reach the per-sheet check. The issuer is still pinned, and a token naming no
-application at all is still refused.
+What an empty array still does not distinguish: **if several Access applications
+route to this Worker, it admits callers from all of them.** To mean "everyone in
+*this* application", list that application's AUD rather than leaving the array
+empty. To open a sheet broadly but not that broadly, leave the array empty and
+add `requireEmailDomains` or `requireIdpGroups`, which still apply.
 
 ### Which Access attributes are usable, and which are not
 
 | Attribute | Where it comes from | Use it for |
 | --- | --- | --- |
-| `aud` | Always in the app token | **Authorizing the sheet.** Never trimmed, never absent. |
-| `email` | App token, human logins | Identifying the submitter; stamped into `_identity`. |
-| `common_name` | App token, service tokens | Identifying a machine client (`sub` is empty and there is no email). |
-| `custom.groups` | App token, **only if** you configure `groups` as a custom SAML attribute / OIDC claim | A hint, not a gate — see below. |
-| Access + IdP groups | `/cdn-cgi/access/get-identity` | Authoritative group membership, browser sessions only, costs a subrequest. |
-| Device posture, country, IP | `/cdn-cgi/access/get-identity` | Better expressed as an Access policy rule. |
+| `aud` | `ctx.access.aud` | **Authorizing the sheet.** Present on every authenticated request. |
+| `email` | `ctx.access.getIdentity()` | Identifying the submitter; stamped into `_identity`. |
+| Access + IdP groups | `ctx.access.getIdentity()` | Group membership, authoritative. |
+| Device posture, country, IP | `ctx.access.getIdentity()` | Better expressed as an Access policy rule. |
 
-Cloudflare's own documentation is blunt about the group claim:
+`getIdentity()` returns the identity Access itself holds, so the groups it
+reports are authoritative. There is no ~1 KB `custom` claim to be silently
+trimmed here — that trimming is what made JWT group claims unsafe to gate on,
+because it drops the groups of exactly the users who belong to the most of them.
+A sheet can declare `requireIdpGroups` or `requireAccessGroups` and both are
+matched against that one list.
 
-> Access trims custom attributes and claims when the serialized `custom` claim
-> exceeds roughly 1 KB... a user who belongs to many groups can receive a token
-> without their `groups` claim while other users on the same application keep
-> it. **Do not rely on custom claims in the JWT for authorization decisions
-> when they may grow large.**
-
-So a Worker that gated on `custom.groups` would deny exactly the users in the
-most groups, intermittently, and look like a flaky bug. That is why groups are
-not the primary mechanism here. If you want group-based narrowing anyway, a
-sheet can declare `requireIdpGroups` (reads the claim) or `requireAccessGroups`
-(calls `get-identity`, authoritative) — but prefer expressing it as an Access
-policy and letting `aud` carry the answer.
+Still prefer expressing membership as an Access policy and letting `aud` carry
+the answer: the policy is audited and syncs from your IdP, and a list in
+`SHEET_ACCESS` is neither.
 
 ### What this Worker does *not* trust
 
-The `Cf-Access-Authenticated-User-Email` header. It is convenient and it is
-also just a header: any client can send one, and a Worker route stays reachable
-on its own hostname even when you believe Access is in front of it. This Worker
-verifies the JWT signature against `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`,
-pins the issuer, and requires the audience to be one you configured. An
-unverified token is treated as no token.
+Request headers, including `Cf-Access-Authenticated-User-Email`. They are
+convenient and they are also just headers: any client can send one, and a Worker
+route stays reachable on its own hostname even when you believe Access is in
+front of it.
+
+Identity comes from `ctx.access` instead, which the runtime attaches only after
+Access has authenticated the request against one of your own applications. A
+caller cannot forge it, because it is not part of the request they sent. A
+request Access did not authenticate arrives with `ctx.access` undefined and is
+refused, so a route that is reachable without Access fails closed rather than
+falling back to whatever the caller claimed to be.
 
 ## Setup
 
@@ -155,7 +150,6 @@ In `wrangler.jsonc`:
 
 ```jsonc
 "vars": {
-  "ACCESS_TEAM_DOMAIN": "acme",
   "SHEET_ACCESS": {
     "1AbC...": ["32eafc76..."],
     "1XyZ...": { "auds": ["9b41de02...", "32eafc76..."], "label": "hr intake",
@@ -185,7 +179,7 @@ Every row is prefixed with two columns unless `STAMP_IDENTITY` is `"false"`:
 
 | `_received_at` | `_identity` |
 | --- | --- |
-| `2026-01-02T03:04:05.000Z` | `ada@example.com` or `service-token:e367...access` |
+| `2026-01-02T03:04:05.000Z` | `ada@example.com` |
 
 Because stamped columns are part of the submission, they are part of the
 header comparison too. Migrating an existing Apps Script sheet: either add
@@ -235,17 +229,15 @@ code is stable; the detail is advisory text for whoever is wiring the form up.
 
 | Code | Status | Meaning |
 | --- | --- | --- |
-| `access_jwt_missing` | 401 | No Access token — the request did not come through Access. |
-| `access_jwt_bad_signature`, `access_jwt_unknown_key`, `access_jwt_malformed` | 401 | Token did not verify. |
-| `access_jwt_expired` | 401 | Sign in again. |
-| `access_jwt_wrong_issuer`, `access_jwt_wrong_audience` | 403 | Token is from another team or another application. |
+| `access_jwt_missing` | 401 | No Access identity — the request did not come through Access. |
+| `access_identity_unknown` | 403 | Access authenticated the caller but returned no email. A service token has no identity behind it and is refused here. |
 | `sheet_not_specified` | 400 | The request named no sheet and `DEFAULT_SHEET_ID` is unset. |
 | `not_authorized` | 403 | The sheet is not configured, or this caller's application is not on its list. |
 | `invalid_json`, `invalid_payload`, `invalid_field_name` | 400 | Unusable body. |
 | `header_mismatch` | 409 | The form's shape and the sheet's header row disagree. |
 | `payload_too_large`, `field_too_large` | 413 | Over `MAX_BODY_BYTES` or a 50k-character cell. |
 | `too_many_columns` | 422 | A first submission defining more than 512 columns. |
-| `not_configured` | 500 | Missing team domain, sheet map, or service-account secret. |
+| `not_configured` | 500 | Missing or unparseable sheet map, or missing service-account secret. |
 | `sheet_not_shared` | 502 | Share the spreadsheet with the service account. |
 | `sheet_not_found` | 502 | Google has no spreadsheet with that id. |
 | `sheets_api_unavailable` | 503 | Google rate-limited us or is down; retry. |
@@ -254,7 +246,6 @@ code is stable; the detail is advisory text for whoever is wiring the form up.
 
 | Var | Default | Purpose |
 | --- | --- | --- |
-| `ACCESS_TEAM_DOMAIN` | — | `acme` or `acme.cloudflareaccess.com`. |
 | `SHEET_ACCESS` | — | Spreadsheet id → allowed Access AUDs; see `src/sheet-access.js`. |
 | `DEFAULT_SHEET_ID` | *(empty)* | Sheet used when a request names none. |
 | `RESPONSES_TAB` | `Responses` | Default tab; a sheet's `tab` wins. |
@@ -263,10 +254,16 @@ code is stable; the detail is advisory text for whoever is wiring the form up.
 | `MAX_BODY_BYTES` | `131072` | Request body ceiling. |
 | `GOOGLE_SERVICE_ACCOUNT_KEY` | — | **Secret.** The service-account key JSON. |
 
-Per-sheet keys: `auds` (required; `[]` allows any authenticated caller),
-`label`, `tab`, `stamp`, `allowMissingFields`, `requireEmails`,
+Per-sheet keys: `auds` (required; `[]` allows any caller Access admitted to this
+route), `label`, `tab`, `stamp`, `allowMissingFields`, `requireEmails`,
 `requireEmailDomains`, `requireServiceTokens`, `requireIdpGroups`,
 `requireAccessGroups`. An array in place of the object is shorthand for `auds`.
+
+`requireIdpGroups` and `requireAccessGroups` both match against the groups
+`getIdentity()` returns, and a sheet naming groups under either is matched
+against the union. `requireServiceTokens` can no longer be satisfied — a service
+token is refused for having no identity — but a sheet declaring one stays
+closed rather than becoming unconstrained.
 
 ## Known limits
 
@@ -276,11 +273,14 @@ Per-sheet keys: `auds` (required; `[]` allows any authenticated caller),
   race left is two submissions to a brand-new empty tab, where both may try to
   write the header row. Send the first submission yourself, or pre-create the
   header row, if that matters.
-- **An empty `auds` array is wider than it looks** — see above. It is the one
-  setting here that can be wrong in a way Access will not catch for you.
-- **`requireAccessGroups` does not work for service tokens.** A service token
-  has no IdP identity to fetch, so `get-identity` has nothing to return. Use
-  `requireServiceTokens`, or put the token in the Access policy.
+- **An empty `auds` array admits every Access application that routes here** —
+  see above. It is the one setting here that can be wrong in a way Access will
+  not catch for you.
+- **Service tokens cannot submit.** A service token authenticates to Access but
+  has no IdP identity behind it, so `getIdentity()` returns no email and the
+  request is refused with `access_identity_unknown`. This Worker is built for
+  browser submissions; machine clients would need an identity to stamp into
+  `_identity`.
 - **Google access tokens are cached per isolate**, not shared, so a burst across
   many colos costs one token exchange each. Deliberate: an access token is a
   bearer credential and does not belong in a store every colo reads.
@@ -297,7 +297,13 @@ npx wrangler dev
 npx wrangler tail   # unexpected errors are logged here, not returned to callers
 ```
 
-`npm test` covers claim validation, sheet authorization, header-drift detection,
-value handling and payload sanitising — the parts where a mistake is a security
-or data-integrity problem. The Sheets and Access HTTP calls are thin wrappers
-over `fetch` and are exercised against the real services with `wrangler dev`.
+`npm test` covers identity handling, sheet authorization, header-drift
+detection, value handling and payload sanitising — the parts where a mistake is
+a security or data-integrity problem.
+
+The `access.dev` block in `wrangler.jsonc` simulates a signed-in Access identity
+under `wrangler dev`, so both paths can be exercised locally: change
+`identity.email` to submit as someone else, or delete the block to see what an
+unauthenticated request gets. It applies to `wrangler dev` only and is ignored
+on deploy, where the real Access application supplies `ctx.access`. The Sheets
+API calls are thin wrappers over `fetch` and still need the real service.

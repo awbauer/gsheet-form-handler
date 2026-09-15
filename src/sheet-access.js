@@ -22,33 +22,37 @@
 // refused with the same error either way, so the parameter cannot be used to
 // discover which sheets exist.
 //
-// AN EMPTY ARRAY MEANS ANY AUTHENTICATED CALLER. Read that as "anyone holding a
-// valid Access token issued by your team" — not "anyone in the Access
-// application in front of this Worker". Cloudflare signs one token per
-// application, all from the same team issuer, so a user authorized only for
-// some unrelated application in your team also satisfies an empty list. Two
-// things follow:
+// AN EMPTY ARRAY MEANS ANY CALLER ACCESS ADMITTED TO THIS ROUTE. The runtime
+// only populates ctx.access when Access authenticated this request against an
+// application covering this route, so a token minted for some unrelated
+// application elsewhere in the account does not satisfy an empty list, and a
+// route Access is not in front of gets no identity at all and is refused.
 //
-//   * Keep this Worker off a route that is reachable without Access (turn off
-//     its workers.dev subdomain), or an empty list is the only thing between a
-//     stray team token and your sheet.
-//   * To mean "everyone in *this* application", list that application's AUD
-//     rather than leaving the array empty. To narrow an open sheet without
-//     naming applications, add requireEmailDomains or requireIdpGroups below.
+// What an empty array still does not distinguish: if several Access
+// applications route to this Worker, it admits callers from all of them. To
+// mean "everyone in *this* application", list that application's AUD rather
+// than leaving the array empty. To narrow an open sheet without naming
+// applications, add requireEmailDomains or requireIdpGroups below.
 //
 // Optional per sheet, all of which further narrow an already-allowed caller:
 //
 //   "requireEmails":       ["ada@example.com"]
 //   "requireEmailDomains": ["example.com"]
 //   "requireServiceTokens":["e367826f93b8d71185e03fe518aff3b4.access"]
-//   "requireIdpGroups":    ["Finance-Team"]   // from the JWT `custom.groups`
-//   "requireAccessGroups": ["Finance"]        // from /cdn-cgi/access/get-identity
+//   "requireIdpGroups":    ["Finance-Team"]
+//   "requireAccessGroups": ["Finance"]
 //
-// requireIdpGroups reads a custom SAML/OIDC claim, which Cloudflare documents
-// as best-effort: Access trims the `custom` claim at roughly 1 KB, so a user in
-// many groups can arrive without their groups at all. requireAccessGroups asks
-// the identity endpoint instead, which is authoritative but costs a subrequest
-// and returns nothing for a service token.
+// Both group keys read the same list now: ctx.access.getIdentity() returns the
+// authoritative identity Access holds, so there is no longer a trimmed JWT
+// claim to second-guess and no subrequest to avoid. They are kept apart only
+// because removing either one would silently drop a constraint from a sheet
+// that already declares it; a sheet naming groups under either key is matched
+// against the union.
+//
+// requireServiceTokens can no longer be satisfied: a service token has no IdP
+// identity, so it is refused in src/access.js before any sheet is considered.
+// The key is still honoured as a declared constraint, which keeps a sheet that
+// names one closed rather than accidentally opening it to everybody.
 
 import { HttpError } from './http.js';
 
@@ -118,18 +122,6 @@ export function parseSheetAccess(env) {
   return sheets;
 }
 
-// The union of every configured audience, used to reject a token from an
-// unrelated application before any sheet is considered. Null when some sheet
-// accepts any authenticated caller, since there is then nothing to pin against.
-export function configuredAudiences(sheets) {
-  const all = new Set();
-  for (const sheet of sheets.values()) {
-    if (sheet.open) return null;
-    for (const aud of sheet.auds) all.add(aud);
-  }
-  return all;
-}
-
 export function audienceAllowed(sheet, identity) {
   if (sheet.open) return true;
   return identity.auds.some((aud) => sheet.auds.includes(aud));
@@ -146,29 +138,23 @@ export function principalAllowed(sheet, identity) {
     const domain = identity.email.slice(identity.email.lastIndexOf('@') + 1);
     if (domain && sheet.requireEmailDomains.includes(domain)) return true;
   }
-  if (identity.commonName && sheet.requireServiceTokens.includes(identity.commonName)) return true;
+  // No branch for requireServiceTokens: a service token carries no IdP
+  // identity, so it never gets past src/access.js. Declaring one still counts
+  // above, which keeps such a sheet closed instead of unconstrained.
   return false;
 }
 
-// Narrowing gate 2: group membership. `loadAccessGroups` is only called when a
-// sheet actually asks for it.
-export async function groupsAllowed(sheet, identity, loadAccessGroups) {
-  const declared = sheet.requireIdpGroups.length + sheet.requireAccessGroups.length;
-  if (declared === 0) return true;
-
-  if (sheet.requireIdpGroups.some((group) => identity.idpGroups.includes(group))) return true;
-
-  if (sheet.requireAccessGroups.length > 0) {
-    const groups = await loadAccessGroups();
-    if (sheet.requireAccessGroups.some((group) => groups.includes(group))) return true;
-  }
-  return false;
+// Narrowing gate 2: group membership, from the identity Access returned.
+export function groupsAllowed(sheet, identity) {
+  const required = [...sheet.requireIdpGroups, ...sheet.requireAccessGroups];
+  if (required.length === 0) return true;
+  return required.some((group) => identity.groups.includes(group));
 }
 
-export async function callerMayWrite(sheet, identity, loadAccessGroups) {
+export function callerMayWrite(sheet, identity) {
   if (!audienceAllowed(sheet, identity)) return false;
   if (!principalAllowed(sheet, identity)) return false;
-  return groupsAllowed(sheet, identity, loadAccessGroups);
+  return groupsAllowed(sheet, identity);
 }
 
 // Which spreadsheet the request is for: an explicit SHEET_ID parameter, the
@@ -184,7 +170,7 @@ export function sheetKeyFrom(url, env) {
   return fallback || null;
 }
 
-export async function resolveSheet(env, identity, url, loadAccessGroups) {
+export function resolveSheet(env, identity, url) {
   const sheets = parseSheetAccess(env);
 
   const key = sheetKeyFrom(url, env);
@@ -195,7 +181,7 @@ export async function resolveSheet(env, identity, url, loadAccessGroups) {
   const sheet = sheets.get(key);
   // An unconfigured id and an id this caller may not write are reported
   // identically, so the parameter cannot be used to enumerate sheets.
-  if (!sheet || !(await callerMayWrite(sheet, identity, loadAccessGroups))) {
+  if (!sheet || !callerMayWrite(sheet, identity)) {
     throw new HttpError(403, 'not_authorized', `${identity.label} may not write the requested sheet`);
   }
   return sheet;
@@ -203,10 +189,10 @@ export async function resolveSheet(env, identity, url, loadAccessGroups) {
 
 // The sheets this caller may write, for /whoami. Showing someone their own
 // entitlements reveals nothing they could not already establish by submitting.
-export async function writableSheets(env, identity, loadAccessGroups) {
+export function writableSheets(env, identity) {
   const allowed = [];
   for (const sheet of parseSheetAccess(env).values()) {
-    if (await callerMayWrite(sheet, identity, loadAccessGroups)) {
+    if (callerMayWrite(sheet, identity)) {
       allowed.push({ sheetId: sheet.sheetId, label: sheet.label, openToAnyAuthenticatedCaller: sheet.open });
     }
   }

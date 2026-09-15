@@ -5,19 +5,25 @@
   "compatibility_date": "2025-09-01",
   "observability": { "enabled": true },
 
-  "vars": {
-    // Your Zero Trust team domain: "acme" or "acme.cloudflareaccess.com".
-    "ACCESS_TEAM_DOMAIN": "",
+  // Simulates an Access identity under `wrangler dev` only; it is ignored on
+  // deploy, where the real Access application supplies ctx.access. Remove this
+  // block to exercise the unauthenticated path locally.
+  "access": {
+    "dev": {
+      "aud": "REPLACE_WITH_ACCESS_APPLICATION_AUD",
+      "identity": { "email": "you@example.com" }
+    }
+  },
 
+  "vars": {
     // Keyed by Google spreadsheet id; the value lists the Access application
     // AUD tags allowed to write that sheet (Zero Trust > Access >
     // Applications > (app) > Overview). The array form below is shorthand for
     // { "auds": [...] }.
     //
-    // AN EMPTY ARRAY ALLOWS ANY AUTHENTICATED CALLER -- that means any valid
-    // Access token from your team, including one issued for an unrelated
-    // application, so keep this Worker off a route reachable without Access.
-    // To mean "everyone in this application", list its AUD instead.
+    // AN EMPTY ARRAY ALLOWS ANY CALLER ACCESS ADMITTED TO THIS ROUTE. If more
+    // than one Access application routes here, it admits callers from all of
+    // them; to mean "everyone in this application", list its AUD instead.
     //
     // Optional per sheet: "label", "tab", "stamp", "allowMissingFields", and
     // the requireEmails / requireEmailDomains / requireServiceTokens /
